@@ -323,8 +323,8 @@ function isRetryableLoadError(res) {
 
   const msg = res.body && typeof res.body === "object" ? res.body.error?.message : undefined;
   if (typeof msg === "string") {
-    if (/busy|unload|failed to load|timeout|not ready|loading/i.test(msg)) return true;
     if (/not found|no such model|does not exist|invalid/i.test(msg)) return false;
+    if (/busy|unload|failed to load|timeout|not ready|loading/i.test(msg)) return true;
   }
   return false;
 }
@@ -431,6 +431,26 @@ function isVerifiedFastPath(state, fullKey, loaded, opts) {
 }
 
 /**
+ * 檢查是否有模型衝突：其他 pending/in-flight 請求要載入不同模型。
+ *
+ * @param {{pending: Set, inFlight: Map}} state - plugin 狀態
+ * @param {object} selfToken - 當前請求的 token 物件
+ * @param {string} fullKey - 當前請求的目標模型 key
+ * @returns {boolean}
+ */
+function hasModelConflict(state, selfToken, fullKey) {
+  for (const p of state.pending ?? []) {
+    if (p === selfToken) continue;
+    if (p.full === null) return true; // 其他請求尚未解析 key，保守視為衝突
+    if (p.full !== fullKey) return true; // 其他請求要不同的模型
+  }
+  for (const k of state.inFlight?.keys?.() ?? []) {
+    if (k !== fullKey) return true; // 背景預載等 in-flight ensure 會卸載此模型
+  }
+  return false;
+}
+
+/**
  * 核心載入流程：確保目標模型真正就緒（可推論）後才回傳。
  *
  * 步驟：
@@ -445,10 +465,9 @@ function isVerifiedFastPath(state, fullKey, loaded, opts) {
  * @param {{queue: Promise, inFlight: Map, verified: Map, sessionModels: Map, apiKey?: string}} state - plugin 狀態
  * @param {string} fullKey - 完整模型 key
  * @param {object} opts - plugin 選項
- * @param {Array<object>} [prefetchedCatalog] - chat.params 已抓取的 catalog（避免重複抓取）
  * @returns {Promise<{fast: boolean}>}
  */
-async function ensureLoaded(state, fullKey, opts, prefetchedCatalog) {
+async function ensureLoaded(state, fullKey, opts) {
   const baseURL = opts.baseURL;
   const fetchImpl = opts.fetchImpl;
   const clientOpts = {
@@ -458,10 +477,22 @@ async function ensureLoaded(state, fullKey, opts, prefetchedCatalog) {
   };
 
   // 1. 快路徑
-  const catalog0 = prefetchedCatalog ?? (await fetchModels(baseURL, fetchImpl, clientOpts));
+  // 注意：必須重新抓取 catalog，不能沿用 chat.params 傳入的 prefetchedCatalog。
+  // 當本 ensure 被序列化 queue 排在另一個 ensure 後面時，prefetchedCatalog 是
+  // 過時資料（可能顯示目標已載入，但實際上已被前一個 ensure 的 unload-all 卸載），
+  // 用過時資料做 fast path 判斷會讓請求在模型未載入時直接放行 → "Model is unloaded"。
+  const catalog0 = await fetchModels(baseURL, fetchImpl, clientOpts);
   const loaded0 = listLoadedFromModels(catalog0);
   if (isVerifiedFastPath(state, fullKey, loaded0, opts)) {
     return { fast: true };
+  }
+
+  // 3.5. 若 catalog 抓取成功但目標模型不在其中 → 直接失敗，避免 unload 現有模型
+  const existsInCatalog = catalog0.some(
+    (m) => m.key === fullKey || (m.key ?? "").split("/").pop() === fullKey
+  );
+  if (catalog0.length > 0 && !existsInCatalog) {
+    throw new Error(`LM Studio 模型 ${fullKey} 不存在於模型庫（請確認模型名稱）`);
   }
 
   // 2. 目標已載入（無論是否唯一）→ 不需重新 load（避免撞 LM Studio 記憶體
@@ -586,16 +617,15 @@ async function ensureLoaded(state, fullKey, opts, prefetchedCatalog) {
  * @param {{queue: Promise, inFlight: Map}} state - plugin 狀態
  * @param {string} fullKey - 完整模型 key
  * @param {object} opts - plugin 選項
- * @param {Array<object>} [prefetchedCatalog] - chat.params 已抓取的 catalog
  * @returns {Promise<{fast: boolean}>}
  */
-function enqueueEnsure(state, fullKey, opts, prefetchedCatalog) {
+function enqueueEnsure(state, fullKey, opts) {
   if (state.inFlight.has(fullKey)) return state.inFlight.get(fullKey);
 
   const p = (async () => {
     state.queue = state.queue
       .then(() => undefined, () => undefined)
-      .then(() => ensureLoaded(state, fullKey, opts, prefetchedCatalog));
+      .then(() => ensureLoaded(state, fullKey, opts));
     await state.queue;
   })();
   // 完成/失敗後都從 inFlight 移除（後續請求會透過 verified cache 直通，
@@ -676,6 +706,7 @@ export default async function (input, options = {}) {
     verified: new Map(), // fullKey -> {instanceId, ts}
     sessionModels: new Map(), // sessionID -> {fullKey, providerID}
     apiKey: opts.apiKey, // LM Studio API token（可由 chat.params 動態更新）
+    pending: new Set(), // pending request tokens for conflict detection
   };
   const timers = new Set(); // 可取消的背景 timer（dispose 時清理）
 
@@ -693,59 +724,65 @@ export default async function (input, options = {}) {
      * @param {object} chatInput - 聊天輸入內容，包含 model 資訊
      * @returns {Promise<void>}
      */
-    "chat.params": async (chatInput, output) => {
-      // 1. 過濾：僅處理目標 provider 的請求
-      const providerId = chatInput?.model?.providerID;
-      if (providerId !== opts.providerID) {
-        return;
-      }
+     "chat.params": async (chatInput, output) => {
+       // 1. 過濾：僅處理目標 provider 的請求
+       const providerId = chatInput?.model?.providerID;
+       if (providerId !== opts.providerID) {
+         return;
+       }
 
-      // 2. 動態取得 API token（provider options 優先，其次為 plugin 選項）
-      const apiKey = chatInput?.provider?.options?.apiKey ?? opts.apiKey;
-      if (apiKey) state.apiKey = apiKey;
+       // 2. 動態取得 API token（provider options 優先，其次為 plugin 選項）
+       const apiKey = chatInput?.provider?.options?.apiKey ?? opts.apiKey;
+       if (apiKey) state.apiKey = apiKey;
 
-      // 3. 取得目標 modelID，並解析為 LM Studio 完整模型 key
-      const targetKey = chatInput?.model?.id;
-      if (!targetKey) {
-        return;
-      }
-      const catalog = await fetchModels(opts.baseURL, opts.fetchImpl, {
-        apiKey: state.apiKey,
-        fetchTimeoutMs: opts.fetchTimeoutMs,
-      });
-      const loaded = listLoadedFromModels(catalog);
-      const fullKey = resolveKeyFromCatalog(catalog, targetKey);
+       // 3. 取得目標 modelID，並建立 pending token
+       const targetKey = chatInput?.model?.id;
+       if (!targetKey) {
+         return;
+       }
+       const pendingToken = { raw: targetKey, full: null };
+       state.pending.add(pendingToken);
 
-      // 4. 記錄 session→model（供 event hook 在 session.error 時定位模型）
-      //    容量上限：超過 maxSessionModels 時刪除最舊的記錄，避免無界成長。
-      if (chatInput?.sessionID) {
-        if (state.sessionModels.size >= opts.maxSessionModels) {
-          const oldest = state.sessionModels.keys().next().value;
-          state.sessionModels.delete(oldest);
-        }
-        state.sessionModels.set(chatInput.sessionID, {
-          fullKey,
-          providerID: providerId,
-        });
-      }
+       try {
+         const catalog = await fetchModels(opts.baseURL, opts.fetchImpl, {
+           apiKey: state.apiKey,
+           fetchTimeoutMs: opts.fetchTimeoutMs,
+         });
+         const loaded = listLoadedFromModels(catalog);
+         const fullKey = resolveKeyFromCatalog(catalog, targetKey);
+         pendingToken.full = fullKey;
 
-      // 5. 快路徑：已驗證就緒 → 直接放行（零額外延遲）
-      if (isVerifiedFastPath(state, fullKey, loaded, opts)) {
-        console.log(`[lmstudio] 目標 ${fullKey} 已驗證就緒，直接放行`);
-        return;
-      }
+         // 4. 記錄 session→model（供 event hook 在 session.error 時定位模型）
+         //    容量上限：超過 maxSessionModels 時刪除最舊的記錄，避免無界成長。
+         if (chatInput?.sessionID) {
+           if (state.sessionModels.size >= opts.maxSessionModels) {
+             const oldest = state.sessionModels.keys().next().value;
+             state.sessionModels.delete(oldest);
+           }
+           state.sessionModels.set(chatInput.sessionID, {
+             fullKey,
+             providerID: providerId,
+           });
+         }
 
-      // 6. 序列化 ensure（同 model 並發會共享同一 promise；傳入 catalog 避免重複抓取）
-      const p = enqueueEnsure(state, fullKey, opts, catalog);
-      try {
-        await p;
-      } catch (e) {
-        console.warn(`[lmstudio] 確保 ${fullKey} 就緒失敗:`, e);
-        throw new Error(
-          `LM Studio 模型 ${fullKey} 載入/就緒失敗（請確認 LM Studio 已啟動且模型存在）: ${e?.message ?? e}`
-        );
-      }
-    },
+         // 5. 快路徑：已驗證就緒且無衝突 → 直接放行（零額外延遲）
+         if (isVerifiedFastPath(state, fullKey, loaded, opts) && !hasModelConflict(state, pendingToken, fullKey)) {
+           console.log(`[lmstudio] 目標 ${fullKey} 已驗證就緒，直接放行`);
+           return;
+         }
+
+         // 6. 序列化 ensure（同 model 並發會共享同一 promise；傳入 catalog 避免重複抓取）
+         const p = enqueueEnsure(state, fullKey, opts);
+         await p;
+       } catch (e) {
+         console.warn(`[lmstudio] 確保 ${pendingToken?.full ?? targetKey} 就緒失敗:`, e);
+         throw new Error(
+           `LM Studio 模型 ${pendingToken?.full ?? targetKey} 載入/就緒失敗（請確認 LM Studio 已啟動且模型存在）: ${e?.message ?? e}`
+         );
+       } finally {
+         state.pending.delete(pendingToken);
+       }
+     },
 
     /**
      * event hook — 監聽 session.error，回應式處理 "Model is unloaded"。

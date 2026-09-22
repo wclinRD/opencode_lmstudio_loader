@@ -11,6 +11,7 @@ import { loadFunction } from "./helpers.mjs";
 
 const extractErrorMessage = loadFunction("extractErrorMessage");
 const isVerifiedFastPath = loadFunction("isVerifiedFastPath");
+const hasModelConflict = loadFunction("hasModelConflict");
 const resolveKeyFromCatalog = loadFunction("resolveKeyFromCatalog");
 const isRetryableLoadError = loadFunction("isRetryableLoadError");
 const httpErrorToString = loadFunction("httpErrorToString");
@@ -109,6 +110,56 @@ describe("isVerifiedFastPath（H2 修正）", () => {
   });
 });
 
+describe("hasModelConflict（Bug 1 修正）", () => {
+  const fullKey = "qwen/qwen3.6-35b-a3b";
+
+  test("無 pending、無 inFlight → false", () => {
+    const state = { pending: new Set(), inFlight: new Map() };
+    assert.equal(hasModelConflict(state, {}, fullKey), false);
+  });
+
+  test("pending 有同模型（full 相同）→ false", () => {
+    const self = { raw: "qwen3.6-35b-a3b", full: fullKey };
+    const other = { raw: "qwen3.6-35b-a3b", full: fullKey };
+    const state = { pending: new Set([self, other]), inFlight: new Map() };
+    assert.equal(hasModelConflict(state, self, fullKey), false);
+  });
+
+  test("pending 有不同模型 → true", () => {
+    const self = { raw: "qwen3.6-35b-a3b", full: fullKey };
+    const other = { raw: "other", full: "other/model" };
+    const state = { pending: new Set([self, other]), inFlight: new Map() };
+    assert.equal(hasModelConflict(state, self, fullKey), true);
+  });
+
+  test("pending 有 full===null 的 token（尚未解析 key）→ true", () => {
+    const self = { raw: "qwen3.6-35b-a3b", full: fullKey };
+    const other = { raw: "other", full: null };
+    const state = { pending: new Set([self, other]), inFlight: new Map() };
+    assert.equal(hasModelConflict(state, self, fullKey), true);
+  });
+
+  test("inFlight 有不同模型 → true", () => {
+    const state = { pending: new Set(), inFlight: new Map([["other/model", Promise.resolve()]]) };
+    assert.equal(hasModelConflict(state, {}, fullKey), true);
+  });
+
+  test("inFlight 有同模型 → false", () => {
+    const state = { pending: new Set(), inFlight: new Map([[fullKey, Promise.resolve()]]) };
+    assert.equal(hasModelConflict(state, {}, fullKey), false);
+  });
+
+  test("selfToken 自己不算衝突", () => {
+    const self = { raw: "qwen3.6-35b-a3b", full: fullKey };
+    const state = { pending: new Set([self]), inFlight: new Map() };
+    assert.equal(hasModelConflict(state, self, fullKey), false);
+  });
+
+  test("state 無 pending / inFlight 欄位 → false（容錯）", () => {
+    assert.equal(hasModelConflict({}, {}, fullKey), false);
+  });
+});
+
 describe("resolveKeyFromCatalog", () => {
   const catalog = [
     { key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen3.6 35B" },
@@ -161,6 +212,15 @@ describe("isRetryableLoadError", () => {
 
   test("404 + not found 訊息 → false", () => {
     const res = { ok: false, status: 404, body: { error: { message: "model not found" } } };
+    assert.equal(isRetryableLoadError(res), false);
+  });
+
+  test("Bug 2：'Failed to load LLM ... Model not found' 複合訊息 → false（不重試）", () => {
+    const res = {
+      ok: false,
+      status: 400,
+      body: { error: { message: "Failed to load LLM 'qwen3.6-35b-a3b': Error: Model not found: qwen3.6-35b-a3b | type: model_load_failed" } },
+    };
     assert.equal(isRetryableLoadError(res), false);
   });
 

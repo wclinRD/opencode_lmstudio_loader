@@ -293,4 +293,96 @@ describe("系統測試：lmstudio-model-loader", () => {
       console.warn = origWarn;
     }
   });
+
+  test("Bug 1：並發請求不同模型 → qwen3.6-35b-a3b 不走 fast path", async () => {
+    const { fetch, calls } = makeFetch({
+      models: [
+        { key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [{ id: "i1", config: {} }] },
+        { key: "other/model", display_name: "Other", type: "llm", loaded_instances: [] },
+      ],
+      loaded: [
+        { key: "other/model", display_name: "Other", type: "llm", loaded_instances: [{ id: "i2", config: {} }] },
+        { key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [{ id: "i3", config: {} }] },
+      ],
+    });
+    const hooks = await plugin({}, { fetchImpl: fetch, baseURL: "http://127.0.0.1:1234" });
+
+    // 建立 verified cache
+    await hooks["chat.params"]({ sessionID: "s1", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    const afterCache = calls.length;
+
+    // 並發兩個請求：other/model（觸發 unload）與 qwen3.6-35b-a3b
+    const p1 = hooks["chat.params"]({ sessionID: "s2", model: { id: "other/model", providerID: "lmstudio" } }, {});
+    const p2 = hooks["chat.params"]({ sessionID: "s3", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    await Promise.all([p1, p2]);
+
+    // qwen3.6-35b-a3b 的請求不應該只走 fast path（應有 unload + load 等額外呼叫）
+    const afterRace = calls.length;
+    const delta = afterRace - afterCache;
+
+    // fast path 只會有 1 次 catalog fetch；但由於 conflict，qwen3.6-35b-a3b 應該觸發 ensure
+    // ensure 會包含：catalog fetch + unload (other/model triggers qwen unload) + load + ping
+    // 所以 delta 應該大於 1
+    assert.ok(delta > 1, `qwen3.6-35b-a3b 不應該只走 fast path（delta=${delta}，fast path 應為 1）`);
+
+    // 驗證有 unload 呼叫（other/model 觸發 unload qwen）
+    const unloadCalls = calls.filter((c) => c.url.endsWith("/api/v1/models/unload"));
+    assert.ok(unloadCalls.length > 0, "應有 unload 呼叫");
+
+    await hooks.dispose?.();
+  });
+
+  test("Bug 4：ensure 排在 queue 後方時重新抓取 catalog（不用過時資料）", async () => {
+    // 自訂 mock：模擬 alwaysSingleModel 的 unload-on-load 行為
+    const calls = [];
+    let qwenLoaded = false; // 初始 qwen 未載入（首次請求會 load）
+    let otherLoaded = false;
+    const fetch = async (url, opts) => {
+      calls.push({ url, opts });
+      if (url.endsWith("/api/v1/models")) {
+        const current = [
+          { key: "qwen/qwen3.6-35b-a3b", type: "llm", loaded_instances: qwenLoaded ? [{ id: "i1", config: {} }] : [] },
+          { key: "other/model", type: "llm", loaded_instances: otherLoaded ? [{ id: "i2", config: {} }] : [] },
+        ];
+        return { ok: true, status: 200, json: async () => ({ models: current }) };
+      }
+      if (url.endsWith("/api/v1/models/load")) {
+        const body = JSON.parse(opts?.body ?? "{}");
+        if (body.model === "other/model") { otherLoaded = true; qwenLoaded = false; }
+        if (body.model === "qwen/qwen3.6-35b-a3b") { qwenLoaded = true; otherLoaded = false; }
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      if (url.endsWith("/api/v1/models/unload")) {
+        const body = JSON.parse(opts?.body ?? "{}");
+        if (body.instance_id === "i1") qwenLoaded = false;
+        if (body.instance_id === "i2") otherLoaded = false;
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      if (url.endsWith("/v1/chat/completions")) {
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "pong" } }] }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+
+    const hooks = await plugin({}, { fetchImpl: fetch, baseURL: "http://127.0.0.1:1234", pollIntervalMs: 20 });
+
+    // 建立 qwen 的 verified cache（首次請求 → load + ping）
+    await hooks["chat.params"]({ sessionID: "s1", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    const qwenLoadsAfterFirst = calls.filter((c) => c.url.endsWith("/api/v1/models/load") && JSON.parse(c.opts?.body ?? "{}").model === "qwen/qwen3.6-35b-a3b").length;
+    assert.equal(qwenLoadsAfterFirst, 1, "首次請求應 load qwen 一次");
+
+    // 並發：other/model（會 unload qwen）+ qwen（原本會用過時 catalog 走 fast path）
+    const p1 = hooks["chat.params"]({ sessionID: "s2", model: { id: "other/model", providerID: "lmstudio" } }, {});
+    const p2 = hooks["chat.params"]({ sessionID: "s3", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    await Promise.all([p1, p2]);
+
+    // qwen 的 ensure 排在 other/model 後面，必須重新抓取 catalog 發現 qwen 已被卸載 → 重新 load
+    const qwenLoadsTotal = calls.filter((c) => c.url.endsWith("/api/v1/models/load") && JSON.parse(c.opts?.body ?? "{}").model === "qwen/qwen3.6-35b-a3b").length;
+    assert.equal(qwenLoadsTotal, 2, `qwen 應被重新載入（共 2 次 load，實際 ${qwenLoadsTotal}）`);
+
+    // 最終 qwen 必須是載入狀態（否則真實 LLM 請求會得到 Model is unloaded）
+    assert.equal(qwenLoaded, true, "最終 qwen 應已載入");
+
+    await hooks.dispose?.();
+  });
 });

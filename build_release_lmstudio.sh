@@ -28,7 +28,13 @@ mkdir -p "${RELEASE_DIR}/tests/lmstudio-model-loader"
 
 echo "==> [4/4] 複製 plugin 與測試到 release"
 cp "${PLUGIN_SRC}" "${RELEASE_DIR}/lmstudio-model-loader.js"
-cp "${TEST_DIR}/"*.mjs "${RELEASE_DIR}/tests/lmstudio-model-loader/"
+# 測試複製到 release 時重寫 plugin 路徑：release 副本位於 release/ 根目錄，
+# 而 source 測試指向 plugins/。sed 將 "../../plugins/lmstudio-model-loader.js"
+# 改為 "../../lmstudio-model-loader.js"（指向 release 內的 plugin 副本）。
+for f in "${TEST_DIR}"/*.mjs; do
+  sed 's|\.\./\.\./plugins/lmstudio-model-loader\.js|../../lmstudio-model-loader.js|' "$f" \
+    > "${RELEASE_DIR}/tests/lmstudio-model-loader/$(basename "$f")"
+done
 
 echo ""
 echo "完成！Release 內容："
