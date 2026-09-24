@@ -77,7 +77,7 @@ The plugin handles requests whose `providerID === "lmstudio"` and defers to the 
           "attachment": true,
           "modalities": { "input": ["text", "image"], "output": ["text"] },
           "limit": {
-            "context": 145328,
+            "context": 195328,
             "output": 8192
           },
           "options": { "maxOutputTokens": 8192 }
@@ -92,11 +92,13 @@ The plugin handles requests whose `providerID === "lmstudio"` and defers to the 
 
 | Priority | Source | Description |
 |---|---|---|
-| 1 | `models.<id>.limit.context` | The model's setting in `opencode.jsonc` (145328 in the example above) — **resolved dynamically** on every request |
+| 1 | `models.<id>.limit.context` | The model's setting in `opencode.jsonc` (195328 in the example above) — **resolved dynamically** on every request |
 | 2 | Plugin option `contextLength` | Fallback, used when the model has no `limit` configured |
 | — | Neither | `context_length` is omitted and LM Studio loads the model at its default |
 
 To change the loaded context, just edit the `limit.context` number in `opencode.jsonc` — the plugin picks it up automatically, no plugin changes needed.
+
+> ⚠️ **MLX engine limitation**: LM Studio's `context_length` parameter **only takes effect for models loaded with the llama.cpp engine (GGUF models)**. MLX-format models (e.g. `*-mlx`) ignore this parameter — LM Studio computes the context automatically based on currently available memory (e.g. 195328). If you use an MLX model, set `limit.context` in `opencode.jsonc` to the value LM Studio actually loaded (query `curl http://127.0.0.1:1234/api/v1/models` → `loaded_instances[].config.context_length`) so opencode's context management matches reality.
 
 ## Plugin options
 

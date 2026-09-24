@@ -77,7 +77,7 @@ plugin 處理 `providerID === "lmstudio"` 的請求，並以 `chat.params` 傳�
           "attachment": true,
           "modalities": { "input": ["text", "image"], "output": ["text"] },
           "limit": {
-            "context": 145328,
+            "context": 195328,
             "output": 8192
           },
           "options": { "maxOutputTokens": 8192 }
@@ -92,11 +92,13 @@ plugin 處理 `providerID === "lmstudio"` 的請求，並以 `chat.params` 傳�
 
 | 優先序 | 來源 | 說明 |
 |---|---|---|
-| 1 | `models.<id>.limit.context` | opencode.jsonc 的模型設定（如上例 145328），**動態讀取**，每次請求都會重新取得 |
+| 1 | `models.<id>.limit.context` | opencode.jsonc 的模型設定（如上例 195328），**動態讀取**，每次請求都會重新取得 |
 | 2 | plugin 選項 `contextLength` | fallback，當模型未設定 `limit` 時使用 |
 | — | 兩者皆無 | 不送出 `context_length`，由 LM Studio 依模型預設值載入 |
 
 只需修改 `opencode.jsonc` 的 `limit.context` 數字即可調整載入 context，不必改 plugin。
+
+> ⚠️ **MLX 引擎限制**：LM Studio 的 `context_length` 參數**僅對 llama.cpp 引擎（GGUF 模型）有效**。MLX 格式的模型（例如 `*-mlx`）會忽略此參數，改由 LM Studio 依目前可用記憶體自動計算 context（例如 195328）。若使用 MLX 模型，建議將 `limit.context` 設為 LM Studio 實際載入的值（查詢方式：`curl http://127.0.0.1:1234/api/v1/models` → `loaded_instances[].config.context_length`），讓 opencode 的 context 管理與實際一致。
 
 ## Plugin 選項
 
