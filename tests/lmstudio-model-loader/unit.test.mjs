@@ -18,6 +18,7 @@ const httpErrorToString = loadFunction("httpErrorToString");
 const listLoadedFromModels = loadFunction("listLoadedFromModels");
 const normalizeBaseURL = loadFunction("normalizeBaseURL");
 const isUnloadedMessage = loadFunction("isUnloadedMessage");
+const resolveContextLength = loadFunction("resolveContextLength");
 
 describe("extractErrorMessage（C1 修正）", () => {
   test("SDK NamedError 結構 { name, data: { message } } → 回傳 data.message", () => {
@@ -322,5 +323,36 @@ describe("isUnloadedMessage", () => {
 
   test("null → false", () => {
     assert.equal(isUnloadedMessage(null), false);
+  });
+});
+
+describe("resolveContextLength(context_length 支援)", () => {
+  test("limit.context 優先於 plugin option", () => {
+    assert.equal(resolveContextLength(145328, 12345), 145328);
+  });
+
+  test("無 limit.context → 使用 plugin option", () => {
+    assert.equal(resolveContextLength(undefined, 12345), 12345);
+  });
+
+  test("兩者皆無 → undefined（不指定，LM Studio 自行決定）", () => {
+    assert.equal(resolveContextLength(undefined, undefined), undefined);
+  });
+
+  test("limit.context 非正整數（字串）→ 忽略，退回 plugin option", () => {
+    assert.equal(resolveContextLength("145328", 12345), 12345);
+  });
+
+  test("limit.context 為 0 → 忽略，退回 plugin option", () => {
+    assert.equal(resolveContextLength(0, 12345), 12345);
+  });
+
+  test("limit.context 為負數 → 忽略", () => {
+    assert.equal(resolveContextLength(-100, undefined), undefined);
+  });
+
+  test("plugin option 非正整數 → 忽略", () => {
+    assert.equal(resolveContextLength(undefined, 0), undefined);
+    assert.equal(resolveContextLength(undefined, 1.5), undefined);
   });
 });

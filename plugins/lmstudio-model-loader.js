@@ -186,26 +186,50 @@ async function unloadInstance(baseURL, instanceId, fetchImpl, opts = {}) {
 }
 
 /**
+ * 決定載入模型時的 context_length。
+ *
+ * 優先序：opencode 模型設定的 `limit.context`（chat.params 的 model.limit.context，
+ * 也就是 opencode.jsonc 中該模型的 `"limit": { "context": N }`）→ plugin option
+ * `contextLength`。兩者皆為正整數才採用；皆無時回傳 undefined（不指定
+ * context_length，由 LM Studio 依模型預設值載入）。
+ *
+ * @param {unknown} modelContext - chat.params 的 model.limit.context
+ * @param {unknown} pluginContext - plugin option contextLength
+ * @returns {number|undefined}
+ */
+function resolveContextLength(modelContext, pluginContext) {
+  if (Number.isInteger(modelContext) && modelContext > 0) return modelContext;
+  if (Number.isInteger(pluginContext) && pluginContext > 0) return pluginContext;
+  return undefined;
+}
+
+/**
  * 載入指定的模型。
  *
- * 呼叫 POST {baseURL}/api/v1/models/load，body 為 `{ "model": modelKey }`。
+ * 呼叫 POST {baseURL}/api/v1/models/load，body 為 `{ "model": modelKey }`；
+ * 若 opts.contextLength 為正整數則一併帶上 `context_length`，讓 LM Studio
+ * 以指定的 context 載入（而非使用模型預設最大值）。
  * 失敗時回傳 { ok:false, status, body }，不會拋出錯誤（由呼叫端決定重試）。
  *
  * @param {string} baseURL - LM Studio API 基礎 URL
  * @param {string} modelKey - 要載入的模型 key
  * @param {Function} fetchImpl - fetch 實作
- * @param {{apiKey?: string, loadFetchTimeoutMs?: number}} [opts] - 請求選項
+ * @param {{apiKey?: string, loadFetchTimeoutMs?: number, contextLength?: number}} [opts] - 請求選項
  * @returns {Promise<{ok: boolean, status: number, body?: unknown}>}
  */
 async function loadModel(baseURL, modelKey, fetchImpl, opts = {}) {
   try {
+    const reqBody = { model: modelKey };
+    if (Number.isInteger(opts.contextLength) && opts.contextLength > 0) {
+      reqBody.context_length = opts.contextLength;
+    }
     const res = await fetchWithTimeout(
       fetchImpl,
       `${baseURL}/api/v1/models/load`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", ...apiHeaders(opts.apiKey) },
-        body: JSON.stringify({ model: modelKey }),
+        body: JSON.stringify(reqBody),
       },
       opts.loadFetchTimeoutMs ?? 30000
     );
@@ -470,10 +494,14 @@ function hasModelConflict(state, selfToken, fullKey) {
 async function ensureLoaded(state, fullKey, opts) {
   const baseURL = opts.baseURL;
   const fetchImpl = opts.fetchImpl;
+  // 有效 context_length：優先取 chat.params 存入的該模型 limit.context
+  // （state.contextLengths），其次為 plugin option contextLength。
+  const contextLength = state.contextLengths?.get(fullKey) ?? opts.contextLength;
   const clientOpts = {
     apiKey: state.apiKey,
     fetchTimeoutMs: opts.fetchTimeoutMs,
     loadFetchTimeoutMs: opts.loadFetchTimeoutMs,
+    contextLength,
   };
 
   // 1. 快路徑
@@ -668,6 +696,8 @@ function enqueueEnsure(state, fullKey, opts) {
  * @param {number} [options.loadFetchTimeoutMs] - load 請求的 fetch 逾時（預設 30000）
  * @param {number} [options.maxSessionModels] - session→model 記錄上限（預設 500，超過刪除最舊）
  * @param {string} [options.apiKey] - LM Studio API token（也可由 chat.params 的 provider options 動態取得）
+ * @param {number} [options.contextLength] - 載入 LM Studio 模型時的 context_length fallback
+ *   （主要來源是 opencode 模型設定中的 limit.context，兩者取其一；皆無則不指定）
  * @returns {Promise<{ [key: string]: Function }>} Hooks 物件
  */
 export default async function (input, options = {}) {
@@ -705,6 +735,7 @@ export default async function (input, options = {}) {
     inFlight: new Map(), // fullKey -> Promise（同 model 並發合併）
     verified: new Map(), // fullKey -> {instanceId, ts}
     sessionModels: new Map(), // sessionID -> {fullKey, providerID}
+    contextLengths: new Map(), // fullKey -> 該模型載入時的 context_length
     apiKey: opts.apiKey, // LM Studio API token（可由 chat.params 動態更新）
     pending: new Set(), // pending request tokens for conflict detection
   };
@@ -751,6 +782,16 @@ export default async function (input, options = {}) {
          const loaded = listLoadedFromModels(catalog);
          const fullKey = resolveKeyFromCatalog(catalog, targetKey);
          pendingToken.full = fullKey;
+
+         // 3.5 記錄此模型的 context_length：優先讀取 opencode 模型設定中的
+         //     limit.context（opencode.jsonc 的 "limit": { "context": N }），
+         //     其次為 plugin option contextLength；皆無則不指定（LM Studio
+         //     依模型預設值載入）。存入 state 供 event 背景預載沿用。
+         const ctx = resolveContextLength(
+           chatInput?.model?.limit?.context,
+           opts.contextLength
+         );
+         if (ctx) state.contextLengths.set(fullKey, ctx);
 
          // 4. 記錄 session→model（供 event hook 在 session.error 時定位模型）
          //    容量上限：超過 maxSessionModels 時刪除最舊的記錄，避免無界成長。

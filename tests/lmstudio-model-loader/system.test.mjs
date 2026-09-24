@@ -385,4 +385,94 @@ describe("系統測試：lmstudio-model-loader", () => {
 
     await hooks.dispose?.();
   });
+
+  test("context_length：模型 limit.context=145328 → load body 帶 context_length=145328", async () => {
+    const { fetch, calls } = makeFetch({
+      models: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [] }],
+      loaded: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [{ id: "i1", config: {} }] }],
+    });
+    const hooks = await plugin({}, { fetchImpl: fetch, baseURL: "http://127.0.0.1:1234" });
+    await hooks["chat.params"]({
+      sessionID: "s1",
+      model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio", limit: { context: 145328, output: 8192 } },
+    }, {});
+    const loadCall = calls.find((c) => c.url.endsWith("/api/v1/models/load"));
+    assert.ok(loadCall, "應呼叫 load");
+    assert.equal(JSON.parse(loadCall.opts.body).context_length, 145328, "load body 應帶 context_length=145328");
+    await hooks.dispose?.();
+  });
+
+  test("context_length：無 limit.context + plugin option contextLength=12345 → 用 option", async () => {
+    const { fetch, calls } = makeFetch({
+      models: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [] }],
+      loaded: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [{ id: "i1", config: {} }] }],
+    });
+    const hooks = await plugin({}, {
+      fetchImpl: fetch,
+      baseURL: "http://127.0.0.1:1234",
+      contextLength: 12345,
+    });
+    await hooks["chat.params"]({ sessionID: "s1", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    const loadCall = calls.find((c) => c.url.endsWith("/api/v1/models/load"));
+    assert.ok(loadCall, "應呼叫 load");
+    assert.equal(JSON.parse(loadCall.opts.body).context_length, 12345, "load body 應帶 context_length=12345");
+    await hooks.dispose?.();
+  });
+
+  test("context_length：皆未設定 → load body 不帶 context_length（維持原行為）", async () => {
+    const { fetch, calls } = makeFetch({
+      models: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [] }],
+      loaded: [{ key: "qwen/qwen3.6-35b-a3b", display_name: "Qwen", type: "llm", loaded_instances: [{ id: "i1", config: {} }] }],
+    });
+    const hooks = await plugin({}, { fetchImpl: fetch, baseURL: "http://127.0.0.1:1234" });
+    await hooks["chat.params"]({ sessionID: "s1", model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio" } }, {});
+    const loadCall = calls.find((c) => c.url.endsWith("/api/v1/models/load"));
+    assert.ok(loadCall, "應呼叫 load");
+    const loadBody = JSON.parse(loadCall.opts.body);
+    assert.equal("context_length" in loadBody, false, "不應帶 context_length");
+    assert.equal(loadBody.model, "qwen/qwen3.6-35b-a3b", "仍應帶 model");
+    await hooks.dispose?.();
+  });
+
+  test("context_length：event 背景預載重新 load 時沿用同一 context_length", async () => {
+    const calls = [];
+    let qwenLoaded = true;
+    const fetch = async (url, opts) => {
+      calls.push({ url, opts });
+      if (url.endsWith("/api/v1/models")) {
+        return { ok: true, status: 200, json: async () => ({
+          models: [
+            { key: "qwen/qwen3.6-35b-a3b", type: "llm", loaded_instances: qwenLoaded ? [{ id: "i1", config: {} }] : [] },
+          ],
+        }) };
+      }
+      if (url.endsWith("/api/v1/models/load")) {
+        qwenLoaded = true;
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      if (url.endsWith("/v1/chat/completions")) {
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "pong" } }] }) };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    const hooks = await plugin({}, { fetchImpl: fetch, baseURL: "http://127.0.0.1:1234", pollIntervalMs: 20 });
+    // 首次：模型已載入 → 只做 ping 驗證，無 load 呼叫
+    await hooks["chat.params"]({
+      sessionID: "s1",
+      model: { id: "qwen3.6-35b-a3b", providerID: "lmstudio", limit: { context: 145328, output: 8192 } },
+    }, {});
+    assert.equal(
+      calls.filter((c) => c.url.endsWith("/api/v1/models/load")).length,
+      0,
+      "已載入不應觸發 load"
+    );
+    // 模擬引擎死亡：模型從 catalog 消失 → event 背景預載應重新 load 並帶 context_length
+    qwenLoaded = false;
+    await hooks.event({ event: { type: "session.error", properties: { sessionID: "s1", error: SDK_UNLOADED_ERROR } } });
+    await sleep(600); // 250ms timer + ensure
+    const loadCall = calls.find((c) => c.url.endsWith("/api/v1/models/load"));
+    assert.ok(loadCall, "背景預載應重新 load");
+    assert.equal(JSON.parse(loadCall.opts.body).context_length, 145328, "預載 load 應帶 context_length=145328");
+    await hooks.dispose?.();
+  });
 });
