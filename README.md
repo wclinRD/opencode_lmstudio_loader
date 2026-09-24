@@ -1,5 +1,7 @@
 # LM Studio Model Loader Plugin（opencode）
 
+> 🌏 English version: [README_en.md](README_en.md) · 中文版：本文件
+
 確保 [opencode](https://opencode.ai) 每次對 LM Studio 發出 LLM 請求前，目標模型**已載入且引擎真的可以推論**、系統只保留單一模型，並能應對 LM Studio 的 Idle TTL / Auto-Evict / 引擎載入後死亡等狀態變化。
 
 ## 特性
