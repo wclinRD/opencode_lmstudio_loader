@@ -1,0 +1,13 @@
+{
+  "name": "lmstudio-model-loader",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LM Studio Model Loader opencode plugin（含測試）",
+  "scripts": {
+    "test": "node --test tests/",
+    "test:unit": "node --test tests/lmstudio-model-loader.test.mjs",
+    "test:live": "node --test tests/live.test.mjs",
+    "check": "node --check lmstudio-model-loader.js"
+  }
+}
