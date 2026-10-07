@@ -47,3 +47,34 @@
   - 真機 LM Studio e2e：ensure（catalog/load/ping 336ms）→ 真實推論 → succeeded；全域 `~/.config/opencode/plugins/` 自動探索已實測
   - 全域 `opencode.json` 壞條目已移除（備份 `opencode.json.bak-20261008`），改以自動探索安裝 `~/.config/opencode/plugins/lmstudio-model-loader.js`
 - [x] T7 git init / commit：✅ 完成（`.gitignore` + 首次 commit；`.probe/` 探測目錄與 mock server 已清理）
+
+## 二次 Review（2026-10-08）— 待處理問題清單
+
+> 狀態：測試 16/16 pass + 1 skip、release/ 與原始碼一致、全域安裝一致、git clean。
+> 以下為本輪 Review 發現的問題，依嚴重度分級。
+
+### 中等（建議處理）— ✅ 2026-10-08 全數完成（v3.1.0）
+
+- [x] M1 ✅ `retry` hook 新增 `isRecoverableModelError`：只對 unloaded/未就緒類錯誤復原，其餘錯誤不動 decision；decision 覆寫改 spread 保留既有欄位
+- [x] M2 ✅ `chatPing` 附 `err.status`，新增 `isPermanentPingError`：4xx（非 408/429）/not found/invalid 類 ping 錯誤立即 fail fast
+- [x] M3 ✅ 新選項 `recoveryEnsureTimeoutMs`（預設 15000）：retry hook 內 Promise.race 競速 + clearTimeout，逾時不動 decision、背景 ensure 繼續
+- [x] M4 ✅ unload 逾時改 throw fail fast（含 instance ids 與調大提示），不再硬著頭皮 load
+- [x] M5 ✅ 新增 11 個測試（16→27），含 M1 負向、M2 fail fast、M3 逾時、M4 卡住、alwaysSingleModel:false、cleanup()、catalog fail-fast/離線、Bearer header、baseURL 正規化、sessionModels 淘汰
+- 驗證：impl-validator **PASS 14/14**；`./build_release.sh` 通過（27 單元 + live skip、release v3.1.0）
+- 註：README 測試數已定稿 27/27；待辦剩 L1–L8、S1–S2
+
+### 低（文件/一致性）
+
+- [ ] L1 兩份 README 寫「LRU 淘汰」，實為 FIFO（Map 既有 key 重新 set 不更新順序）
+- [ ] L2 「零延遲直通」誇大：快路徑仍會 GET /api/v1/models（本地、低成本，但不是零）
+- [ ] L3 README 檔案結構未列 `release/`、`todo.md`、`.gitignore`（release/ 有提交到 git）
+- [ ] L4 `VERSION.txt` 含 timestamp → 每次 build 弄髒 working tree（考慮 release/ 加 .gitignore 或去掉 timestamp）
+- [ ] L5 `event.decision = {retry:true, delay:0}` 整物件覆寫，未來 V2 decision 若有其他欄位會被丟掉
+- [ ] L6 verified cache 只以 fullKey 為 key，未含 baseURL（hook 動態改 baseURL 後的邊緣情況）
+- [ ] L7 `cleanup()` 不中止/等待進行中的 ensure（背景 fetch 會跑完）
+- [ ] L8 `lmstudio-model-loader.js` 檔案權限為 executable（非必要）
+
+### 建議（repo 卫生）
+
+- [ ] S1 公開到 GitHub 但無 LICENSE
+- [ ] S2 無 CI（GitHub Actions 跑 `npm test`）

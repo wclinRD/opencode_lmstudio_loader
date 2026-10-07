@@ -1,6 +1,6 @@
 {
   "name": "lmstudio-model-loader",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "description": "LM Studio Model Loader opencode plugin（含測試）",

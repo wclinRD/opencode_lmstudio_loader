@@ -8,7 +8,7 @@
 > 本 plugin 為 **opencode V2 plugin API** 版本，已在本機實測通過（2026-10-08）：
 > - **opencode 2.0.20 + 真實 LM Studio**：冷啟動 ensure（catalog → load → poll → ping）→ 真實推論成功
 > - **opencode 2.0.20 + mock server**：`model.request` hook（primary/title）、`retry` hook（decision 覆寫 delay 1605→0）、事件訂閱、失敗復原 → `session.execution.succeeded`
-> - 單元測試 16/16 通過（`node --test`）
+> - 單元測試 27/27 通過（另 live 系統測試未啟動自動 SKIP；`node --test`）
 
 ---
 
@@ -22,7 +22,7 @@
 | **並發序列化** | 不同模型的並發載入**排隊執行**，避免 A 剛載入就被 B 卸載（修復 `Model is unloaded` 主因） |
 | **快路徑 + 快取** | 已驗證且唯一載入 → 零延遲直通（verified cache 含 instanceId + TTL） |
 | **回應式預載** | 訂閱 `session.execution.failed`，偵測 `Model is unloaded` → 失效快取並背景預載，重送即成功 |
-| **失敗自動復原** | `retry` hook：provider 請求失敗時同步重新 ensure，成功則覆寫 `decision = {retry:true, delay:0}` 立即重試 |
+| **失敗自動復原** | `retry` hook：**僅「模型未就緒/unloaded」類錯誤**同步重新 ensure，成功則覆寫 `decision = {retry:true, delay:0}` 立即重試；其餘錯誤沿用 opencode 預設退避 |
 | **卸載完成等待** | unload 是 async，會 poll 到 instance 真正消失才載入新模型 |
 | **load 重試** | transient 錯誤（503/429/network/busy…）退避重試；硬失敗（404 not found）不重試 |
 | Provider 過濾 | 非 `lmstudio` provider 的請求完全不干擾（hook 以 `{ providerID }` scope 註冊） |
@@ -97,7 +97,7 @@ cp lmstudio-model-loader.js ~/.config/opencode/plugins/lmstudio-model-loader/ind
 cat > ~/.config/opencode/plugins/lmstudio-model-loader/package.json <<'EOF'
 {
   "name": "lmstudio-model-loader",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "exports": { ".": "./index.js" }
@@ -149,6 +149,7 @@ EOF
 | `loadFetchTimeoutMs` | `30000` | load/unload API 請求逾時 |
 | `maxSessionModels` | `500` | session→model 記錄上限（LRU 淘汰） |
 | `maxRecoveryAttempts` | `2` | `retry` hook 復原上限（attempt 從 2 開始） |
+| `recoveryEnsureTimeoutMs` | `15000` | 復原 ensure 逾時上限（retry hook；逾時則背景繼續、不動 decision） |
 | `apiKey` | 無 | LM Studio API key（通常不需） |
 
 ---
@@ -230,7 +231,7 @@ Plugin 的 `setup(ctx)` 註冊三個機制，回傳 cleanup function（unload �
        ├─ 1. 查詢目前 LMS 已載入模型（GET /api/v1/models）
        ├─ 2. 快路徑：已驗證且唯一載入？ → 直接放行（零延遲）
        ├─ 3. 目標已是唯一載入但快取過期？ → 跳過 load，直接 ping 驗證
-       ├─ 4. 否則：卸載其他模型（等卸載完成）→ load（失敗退避重試）
+       ├─ 4. 否則：卸載其他模型（卸載逾時 → 直接失敗 fail fast）→ load（失敗退避重試）
        ├─ 5. poll 直到目標 instance 出現
        ├─ 6. ping 就緒驗證（max_tokens=1 chat completion）
        │      └─ 偵測到 "Model is unloaded" → 重新載入再驗
@@ -245,10 +246,14 @@ hook 內拋出的錯誤會 `console.warn` 後 rethrow → 該次請求在 HTTP �
 ```
 provider 請求失敗（attempt ≥ 2）
   └─ attempt > maxRecoveryAttempts（預設 2）？ → 不動 decision，交還 opencode
-  └─ 否則：失效 verified cache → 同步重新 ensure（catalog → load → ping）
-       ├─ 復原成功 → 覆寫 event.decision = { retry: true, delay: 0 }（立即重試）
-       └─ 復原失敗 → 不動 decision（沿用 opencode 預設退避）
+  └─ 錯誤非「模型未就緒/unloaded」類（如 rate limit、無效請求）？ → 不動 decision，沿用 opencode 預設退避
+  └─ 否則（僅模型未就緒類錯誤）：失效 verified cache → 同步重新 ensure（catalog → load → ping）
+       ├─ 復原成功 → 覆寫 event.decision = { ...decision, retry: true, delay: 0 }（立即重試）
+       ├─ 復原失敗 → 不動 decision（沿用 opencode 預設退避）
+       └─ 復原逾時（recoveryEnsureTimeoutMs，預設 15s）→ 不動 decision（沿用預設退避），ensure 背景繼續執行
 ```
+
+只有「模型未就緒/unloaded」類錯誤才值得同步復原；其餘錯誤（rate limit、無效請求等）沿用 opencode 預設退避，不被打斷。
 
 ### 3. `ctx.event.subscribe`（server 全域事件流，回應式預載）
 
@@ -268,10 +273,11 @@ session.deleted（data.sessionID）
 
 | 問題 | 處理方式 |
 |---|---|
-| 日誌出現 `Plugin must export a default definition with an id and an effect or setup function` | default export 不是 `{ id, setup }` 純物件（V1 function 形式）。更新到本版（v3.0.0） |
+| 日誌出現 `Plugin must export a default definition with an id and an effect or setup function` | default export 不是 `{ id, setup }` 純物件（V1 function 形式）。更新到本版（v3.1.0） |
 | 日誌出現 `configured plugin path must be a directory` | 設定檔 `plugins` 的 `package` 指到 `.js` 檔。改為目錄形式（見「方式二」） |
 | 日誌出現 `Cannot find package '@opencode/plugin'` | 檔案用了 V1/未支援的 `import { Plugin }`。本 plugin 不依賴該套件，請勿修改 import |
-| 請求失敗：`{"message":"Model is unloaded."}` | 舊版 plugin 的已知問題，**更新到 v3.0.0**。若仍發生，代表引擎真的載入失敗（如記憶體不足），看 server stdout 的 `[lmstudio]` 訊息 |
+| 請求失敗：`{"message":"Model is unloaded."}` | 舊版 plugin 的已知問題，**更新到 v3.1.0**。若仍發生，代表引擎真的載入失敗（如記憶體不足），看 server stdout 的 `[lmstudio]` 訊息 |
+| 卸載逾時錯誤：`LM Studio 卸載逾時: ... 仍在 catalog` | 舊模型未在期限內卸乾淨，plugin 直接失敗（fail fast）避免撞記憶體 guardrail。調大 `unloadCompletionTimeoutMs`，或重啟 LM Studio |
 | 日誌/畫面出現 `[lmstudio] ... 逾時未就緒` | 模型載入後引擎一直無法推論（可能記憶體不足）。改用較小模型，或降低 LMS 的 model loading guardrails |
 | 載入失敗：`LM Studio 載入失敗: ...` | 模型可能因記憶體不足被 LMS 拒絕。改用較小模型，或降低 LMS 的 model loading guardrails |
 | 模型沒有自動切換 | 1) 確認檔案位於 `plugins/`（複數）目錄或設定檔 `plugins` 目錄條目 2) 重啟 opencode 3) 確認 config 的 providerID 是 `lmstudio` 4) 用上方 grep 確認有 `loading plugin` |
@@ -292,7 +298,7 @@ rm ~/.config/opencode/plugins/lmstudio-model-loader.js   # 或整個 lmstudio-mo
 git clone https://github.com/wclinRD/opencode_lmstudio_loader.git
 cd opencode_lmstudio_loader
 
-# 功能測試（16 項，注入式 fake server + fake V2 ctx，不需 LM Studio）
+# 功能測試（27 項，注入式 fake server + fake V2 ctx，不需 LM Studio）
 npm test
 
 # 真實 LM Studio 系統測試（未啟動會自動 SKIP）

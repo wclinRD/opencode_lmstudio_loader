@@ -289,7 +289,9 @@ async function chatPing(baseURL, fullKey, fetchImpl, opts = {}) {
     } catch {
       // 保留 HTTP 狀態碼描述
     }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status; // 附加狀態碼，供 ensureLoaded 決定是否 fail fast
+    throw err;
   }
 }
 
@@ -301,6 +303,40 @@ async function chatPing(baseURL, fullKey, fetchImpl, opts = {}) {
  */
 function isUnloadedMessage(text) {
   return /model is unloaded/i.test(String(text ?? ""));
+}
+
+/**
+ * 判斷 retry hook 收到的錯誤是否屬於「模型未就緒/unloaded」類，值得同步復原。
+ *
+ * 只有「模型未就緒/unloaded」類錯誤（如 "Model is unloaded."、
+ * "model not loaded"、"not ready"）才值得在 retry hook 內失效快取並
+ * 同步重新 ensure；其餘錯誤（rate limit、無效請求等）重試本身就會成功
+ * 或根本不該立即重試，應沿用 opencode 預設退避機制，不應被本 plugin 打斷。
+ *
+ * @param {string} text - 錯誤訊息（extractErrorMessage 的輸出）
+ * @returns {boolean}
+ */
+function isRecoverableModelError(text) {
+  if (!text) return false;
+  if (isUnloadedMessage(text)) return true;
+  return /model.*not loaded|model not loaded|not ready/i.test(text);
+}
+
+/**
+ * 判斷 ping 錯誤是否「不可重試」，應立刻 fail fast 而非重試到 readyTimeoutMs。
+ *
+ * 4xx（除 408/429）代表請求本身有問題（例如模型名錯誤回 404/400），
+ * 或訊息明示 not found / does not exist / invalid —— 這類持續性錯誤重試
+ * 再久也不會成功；模型名錯不該讓使用者等滿 readyTimeoutMs（預設 300 秒）
+ * 才失敗。408/429 與 unloaded（5xx 訊息）仍屬可重試，沿用原重試邏輯。
+ *
+ * @param {{message?: string, status?: number}} [err] - chatPing 拋出的錯誤
+ * @returns {boolean}
+ */
+function isPermanentPingError(err) {
+  const status = typeof err?.status === "number" ? err.status : 0;
+  if (status >= 400 && status < 500 && status !== 408 && status !== 429) return true;
+  return /not found|no such model|does not exist|invalid/i.test(String(err?.message ?? ""));
 }
 
 /**
@@ -517,8 +553,12 @@ async function ensureLoaded(state, fullKey, opts) {
       await sleep(opts.pollIntervalMs);
     }
     if (unloadStillThere.length > 0) {
-      console.warn(
-        `[lmstudio] 卸載逾時: ${unloadStillThere.map((i) => i.instanceId).join(", ")} 仍在 catalog 中`
+      const ids = unloadStillThere.map((i) => i.instanceId).join(", ");
+      console.warn(`[lmstudio] 卸載逾時: ${ids} 仍在 catalog 中`);
+      // fail fast：舊模型沒卸乾淨就繼續 load 第二個模型，可能撞 LM Studio
+      // 記憶體 guardrail → 直接失敗（沿 model.request catch 包文後中止請求）。
+      throw new Error(
+        `LM Studio 卸載逾時: ${ids} 仍在 catalog（可調大 unloadCompletionTimeoutMs，或重啟 LM Studio）`
       );
     }
   }
@@ -595,6 +635,12 @@ async function ensureLoaded(state, fullKey, opts) {
             await sleep(opts.pollIntervalMs);
           }
         }
+        // 持續性錯誤（4xx 非 408/429、not found / invalid 等）重試再久也不會
+        // 成功 → 立刻 fail fast，不讓模型名錯誤的請求等滿 readyTimeoutMs
+        //（預設 300 秒）才失敗。
+        if (isPermanentPingError(err)) {
+          throw new Error(`LM Studio ping 失敗（不可重試）: ${err?.message ?? err}`);
+        }
         await sleep(opts.pingRetryDelayMs);
       }
     }
@@ -650,9 +696,12 @@ function enqueueEnsure(state, fullKey, opts) {
  *   cache）。失敗時 catch → console.warn 詳訊 → rethrow 中文錯誤中止請求
  *   （per A1 實測：hook throw 會中止 HTTP 派發且不傷害 plugin/server）。
  * - `retry`（scoped）：provider 請求層失敗後、排定重試前觸發（per A2 實測：
- *   attempt 從 2 開始）。失效 verified cache 並 await ensure；ensure 成功才
- *   覆寫 `event.decision = { retry: true, delay: 0 }`，失敗不動 decision。
- *   復原受 maxRecoveryAttempts 限制（預設 2 → 只在 attempt ≤ 2 復原）。
+ *   attempt 從 2 開始）。僅「模型未就緒/unloaded」類錯誤（isRecoverableModelError）
+ *   才復原，其餘錯誤沿用 opencode 預設退避。復原時失效 verified cache 並
+ *   await ensure（與 recoveryEnsureTimeoutMs 競速，逾時不動 decision、
+ *   ensure 背景繼續）；ensure 成功才覆寫
+ *   `event.decision = { ...event.decision, retry: true, delay: 0 }`（保留
+ *   既有欄位），失敗不動 decision。受 maxRecoveryAttempts 限制（預設 2）。
  * - `ctx.event.subscribe`（server 全域事件流，只處理本 plugin 相關型別）：
  *   - `session.execution.failed`：V2 無 session.error，錯誤在 data.error。
  *     萃取訊息 → isUnloadedMessage → 失效快取 → 250ms 後背景 enqueueEnsure。
@@ -692,12 +741,16 @@ export default {
       loadFetchTimeoutMs: 30000,
       maxSessionModels: 500,
       maxRecoveryAttempts: 2, // retry hook 復原上限（attempt 從 2 開始，per A2）
+      recoveryEnsureTimeoutMs: 15000, // retry hook 復原 ensure 逾時上限（避免拖住 opencode retry 排程）
       apiKey: undefined,
       ...userOptions,
     };
     if (typeof opts.fetchImpl !== "function") opts.fetchImpl = globalThis.fetch;
     if (typeof opts.maxRecoveryAttempts !== "number" || !Number.isFinite(opts.maxRecoveryAttempts)) {
       opts.maxRecoveryAttempts = 2;
+    }
+    if (typeof opts.recoveryEnsureTimeoutMs !== "number" || !Number.isFinite(opts.recoveryEnsureTimeoutMs)) {
+      opts.recoveryEnsureTimeoutMs = 15000;
     }
 
     // 讀取 provider settings（V1 的 client.provider.create 已由 opencode.json
@@ -831,7 +884,15 @@ export default {
           return;
         }
 
-        // 3. 定位 fullKey：優先 session→model 記錄，否則由 catalog 解析
+        // 3. 錯誤分類：只有「模型未就緒/unloaded」類錯誤才值得同步復原；
+        //    rate limit、無效請求等其餘錯誤沿用 opencode 預設退避（不動
+        //    decision、不失效快取、不 ensure）。
+        const errMsg = extractErrorMessage(event?.error);
+        if (!isRecoverableModelError(errMsg)) {
+          return;
+        }
+
+        // 4. 定位 fullKey：優先 session→model 記錄，否則由 catalog 解析
         let fullKey = null;
         const rec = state.sessionModels.get(event.sessionID);
         if (rec && rec.providerID === opts.providerID) {
@@ -852,17 +913,45 @@ export default {
           return;
         }
 
-        // 4. 失效 verified cache → 完整 ensure（unload → load → ping 就緒驗證）
+        // 5. 失效 verified cache → 完整 ensure（unload → load → ping 就緒驗證）
+        //    ensure 與 recoveryEnsureTimeoutMs 競速：逾時則背景繼續執行、
+        //    不動 decision（避免 ensure 的 ping 上限把 opencode retry 排程
+        //    拖最多數分鐘）。rejection 由 .then 的 fail 分支吸收，無
+        //    unhandled rejection。
         state.verified.delete(fullKey);
-        try {
-          await enqueueEnsure(state, fullKey, opts);
-        } catch (e) {
+        let timer;
+        let ensureErr = null; // fail 分支捕獲的錯誤（供 warn 顯示）
+        const timeout = new Promise((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), opts.recoveryEnsureTimeoutMs);
+        });
+        const outcome = await Promise.race([
+          enqueueEnsure(state, fullKey, opts).then(
+            () => "ok",
+            (e) => {
+              ensureErr = e;
+              return "fail";
+            }
+          ),
+          timeout,
+        ]);
+        clearTimeout(timer); // 務必清除，避免 timer 洩漏（測試程序被拖住）
+        if (outcome === "fail") {
           // 復原失敗：不動 opencode 的 decision（沿用預設退避/終端失敗）
-          console.warn(`[lmstudio] retry 復原 ensure ${fullKey} 失敗:`, e?.message ?? e);
+          console.warn(
+            `[lmstudio] retry 復原 ensure ${fullKey} 失敗:`,
+            ensureErr?.message ?? ensureErr
+          );
+          return;
+        }
+        if (outcome === "timeout") {
+          // 復原逾時：不動 decision（沿用預設退避），ensure 在背景繼續跑
+          console.warn(
+            `[lmstudio] retry 復原 ensure ${fullKey} 逾時（${opts.recoveryEnsureTimeoutMs}ms），背景 ensure 繼續執行，沿用 opencode 預設退避`
+          );
           return;
         }
         console.log(`[lmstudio] retry 復原成功（attempt=${event.attempt}），立即重試 ${fullKey}`);
-        event.decision = { retry: true, delay: 0 };
+        event.decision = { ...event.decision, retry: true, delay: 0 };
       },
       { providerID: opts.providerID }
     );

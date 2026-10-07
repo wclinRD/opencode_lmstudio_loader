@@ -10,8 +10,12 @@
  * - ping 偵測到 unloaded → nudge reload
  * - load transient 錯誤重試 / 硬失敗不重試
  * - event 訂閱（session.execution.failed）失效快取 + 背景預載
- * - retry hook 復原（decision 覆寫 / 上限不動 decision）
+ * - retry hook 復原（decision 覆寫保留既有欄位 / 非未就緒類錯誤不動 decision
+ *   / ensure 逾時競速不動 decision）
  * - async unload 完成 poll、embedding 跳過 ping、provider 過濾與 hook scope
+ * - fail fast：ping 不可重試錯誤（404）、卸載逾時、模型不在 catalog、catalog 全空
+ * - alwaysSingleModel:false 多模型並存、maxSessionModels 淘汰、cleanup 生命週期
+ * - apiKey → Bearer header、baseURL 正規化（去 /v1 尾綴）
  *
  * 執行：node --test tests/
  */
@@ -39,9 +43,11 @@ class FakeLMStudio {
   constructor({ models, unloadDelayMs = 0 } = {}) {
     this.models = models; // [{key, display_name, type}]
     this.instances = new Map(); // instanceId -> {instanceId, modelKey, healthy}
-    this.log = []; // {t, op, key?, instanceId?, snap: [instanceIds]}
+    this.log = []; // {t, op, key?, instanceId?, headers?, snap: [instanceIds]}
     this.unloadDelayMs = unloadDelayMs;
     this.pendingUnloads = new Map();
+    this.catalogDelayMs = 0; // catalog 回應前延遲（供 recoveryEnsureTimeoutMs 逾時競速測試）
+    this.unloadSticky = false; // true：unload 回 200 但永不移除 instance（供卸載逾時 fail fast 測試）
 
     // 腳本旋鈕
     this.loadFailures = 0;
@@ -82,13 +88,15 @@ class FakeLMStudio {
     const body = init.body ? JSON.parse(init.body) : null;
 
     if (method === "GET" && u.pathname === "/api/v1/models") {
-      this.record("catalog");
+      // 先延遲再回應（模擬慢 catalog，供逾時競速測試）
+      if (this.catalogDelayMs > 0) await sleep(this.catalogDelayMs);
+      this.record("catalog", { headers: init.headers });
       return makeRes(200, this.catalog());
     }
 
     if (method === "POST" && u.pathname === "/api/v1/models/load") {
       const key = this.findModelKey(body.model);
-      this.record("load", { key });
+      this.record("load", { key, headers: init.headers });
       if (this.loadFailures > 0) {
         this.loadFailures -= 1;
         return makeRes(this.loadFailStatus, {
@@ -103,23 +111,26 @@ class FakeLMStudio {
 
     if (method === "POST" && u.pathname === "/api/v1/models/unload") {
       const instanceId = body.instance_id;
-      this.record("unload", { instanceId });
-      if (this.unloadDelayMs > 0) {
-        // 模擬 async unload：延遲後才從 catalog 消失
-        const t = setTimeout(() => {
+      this.record("unload", { instanceId, headers: init.headers });
+      // unloadSticky：回 200 但永不移除 instance（模擬卸載卡住）
+      if (!this.unloadSticky) {
+        if (this.unloadDelayMs > 0) {
+          // 模擬 async unload：延遲後才從 catalog 消失
+          const t = setTimeout(() => {
+            this.instances.delete(instanceId);
+            this.pendingUnloads.delete(instanceId);
+          }, this.unloadDelayMs);
+          this.pendingUnloads.set(instanceId, t);
+        } else {
           this.instances.delete(instanceId);
-          this.pendingUnloads.delete(instanceId);
-        }, this.unloadDelayMs);
-        this.pendingUnloads.set(instanceId, t);
-      } else {
-        this.instances.delete(instanceId);
+        }
       }
       return makeRes(200, { instance_id: instanceId });
     }
 
     if (method === "POST" && u.pathname === "/v1/chat/completions") {
       const key = this.findModelKey(body.model);
-      this.record("ping", { key });
+      this.record("ping", { key, headers: init.headers });
       const inst = this.instances.get(key);
       if (!inst || this.pingUnloaded) {
         return makeRes(this.pingFailStatus, {
@@ -474,7 +485,7 @@ describe("lmstudio-model-loader", () => {
     h.cleanup();
   });
 
-  test("retry hook：復原成功 → 覆寫 decision 立即重試（delay 0）", async () => {
+  test("retry hook：unloaded 錯誤復原成功 → 覆寫 decision", async () => {
     const fake = new FakeLMStudio({ models: [MODEL_A] });
     const h = await makeHarness(fake);
 
@@ -485,12 +496,19 @@ describe("lmstudio-model-loader", () => {
     const event = await h.retry(
       "s1",
       "qwen3.6-35b-a3b",
-      { type: "provider.internal", message: "boom", status: 500 },
-      2
+      { type: "provider.internal", message: "Model is unloaded.", status: 500 },
+      2,
+      { retry: true, delay: 1000, reason: "x" } // 含額外欄位，驗證 spread 保留既有欄位
     );
 
     assert.ok(countOps(fake.log, "ping") > pingBefore, "復原時應重新 ping 驗證");
-    assert.deepEqual(event.decision, { retry: true, delay: 0 }, "復原成功應覆寫 decision");
+    assert.equal(event.decision.reason, "x", "復原成功應保留 decision 的既有額外欄位");
+    assert.equal(event.decision.delay, 0, "復原成功應把 delay 歸零");
+    assert.deepEqual(
+      event.decision,
+      { retry: true, delay: 0, reason: "x" },
+      "復原成功應覆寫 decision（spread 保留其餘欄位）"
+    );
     h.cleanup();
   });
 
@@ -571,6 +589,256 @@ describe("lmstudio-model-loader", () => {
     await h.chat("s1", undefined);
 
     assert.equal(fake.log.length, 0, "不應有任何 API 呼叫");
+    h.cleanup();
+  });
+
+  // ─── M5 覆蓋缺口補測 ────────────────────────────────────────
+
+  test("retry hook：非未就緒類錯誤（rate limit）→ 不動 decision 也不 ensure", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake);
+
+    // 先建立 cache 與 session→model 記錄
+    await h.chat("s1", "qwen3.6-35b-a3b");
+    const pingBefore = countOps(fake.log, "ping");
+    const loadBefore = countOps(fake.log, "load");
+
+    // 429 rate limit 屬「非未就緒類」錯誤 → 不應復原（沿用 opencode 預設退避）
+    const event = await h.retry(
+      "s1",
+      "qwen3.6-35b-a3b",
+      { type: "rate_limit", message: "rate limited" },
+      2
+    );
+
+    assert.deepEqual(
+      event.decision,
+      { retry: true, delay: 1000 },
+      "非未就緒類錯誤不應動 decision（保持預設值）"
+    );
+    assert.equal(countOps(fake.log, "ping"), pingBefore, "不應觸發重新 ensure（ping）");
+    assert.equal(countOps(fake.log, "load"), loadBefore, "不應觸發重新 ensure（load）");
+    h.cleanup();
+  });
+
+  test("ping 不可重試錯誤（404 not found）→ fail fast，不等 readyTimeoutMs", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    fake.pingFailures = Infinity; // 持續失敗（不可重試）
+    fake.pingFailStatus = 404;
+    fake.pingFailMessage = "model not found";
+    const h = await makeHarness(fake, { readyTimeoutMs: 5000 });
+
+    const start = Date.now();
+    await assert.rejects(h.chat("s1", "qwen3.6-35b-a3b"), /不可重試/);
+    const elapsed = Date.now() - start;
+
+    assert.equal(countOps(fake.log, "ping"), 1, "不可重試錯誤只應 ping 一次");
+    assert.ok(
+      elapsed < 2000,
+      `應 fail fast（${elapsed}ms），遠小於 readyTimeoutMs 5000ms`
+    );
+    h.cleanup();
+  });
+
+  test("retry hook：復原 ensure 逾時（recoveryEnsureTimeoutMs）→ 不動 decision、hook 正常返回", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake, { recoveryEnsureTimeoutMs: 50 });
+
+    // 先正常建 cache（此時 catalog 無延遲）
+    await h.chat("s1", "qwen3.6-35b-a3b");
+    const pingBefore = countOps(fake.log, "ping");
+
+    // 讓 ensure 的第一步（catalog 抓取）變慢 → 確定超過 50ms 逾時
+    fake.catalogDelayMs = 200;
+    const start = Date.now();
+    const event = await h.retry(
+      "s1",
+      "qwen3.6-35b-a3b",
+      { type: "provider.internal", message: "Model is unloaded.", status: 500 },
+      2
+    );
+    const elapsed = Date.now() - start;
+
+    assert.deepEqual(
+      event.decision,
+      { retry: true, delay: 1000 },
+      "ensure 逾時不應動 decision（沿用 opencode 預設退避）"
+    );
+    assert.ok(elapsed < 200, `hook 應由逾時競速提前返回（${elapsed}ms < 200ms）`);
+    assert.ok(countOps(fake.log, "ping") >= pingBefore, "背景 ensure 仍在執行不影響 decision");
+
+    // 收尾：恢復 catalog 速度並等背景 ensure 結束，避免跨測試干擾
+    fake.catalogDelayMs = 0;
+    await sleep(300);
+    h.cleanup();
+  });
+
+  test("unload 卡住（逾時未完成）→ fail fast，不載入新模型", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A, MODEL_B] });
+    fake.unloadSticky = true; // unload 回 200 但永不移除 instance
+    // 預先載入 A
+    fake.instances.set(MODEL_A.key, { instanceId: MODEL_A.key, modelKey: MODEL_A.key, healthy: true });
+    const h = await makeHarness(fake, { unloadCompletionTimeoutMs: 100 });
+
+    await assert.rejects(
+      h.chat("s2", "qwen3.6-35b-a3b-fable-holo3.1-mlx"),
+      /卸載逾時/
+    );
+
+    assert.equal(countOps(fake.log, "load"), 0, "卸載逾時不應再 load B（避免撞記憶體 guardrail）");
+    h.cleanup();
+  });
+
+  test("alwaysSingleModel:false → 允許多模型並存，不 unload", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A, MODEL_B] });
+    // 預先載入 A
+    fake.instances.set(MODEL_A.key, { instanceId: MODEL_A.key, modelKey: MODEL_A.key, healthy: true });
+    const h = await makeHarness(fake, { alwaysSingleModel: false });
+
+    await h.chat("s2", "qwen3.6-35b-a3b-fable-holo3.1-mlx");
+
+    assert.equal(countOps(fake.log, "unload"), 0, "關閉單一模型約束時不應 unload A");
+    assert.ok(fake.instances.has(MODEL_A.key), "A 應仍存在");
+    assert.ok(fake.instances.has(MODEL_B.key), "B 應載入成功");
+    assert.equal(fake.instances.size, 2, "A 與 B 應同時存在");
+    h.cleanup();
+  });
+
+  test("cleanup()：移除 hooks、事件訂閱停止後不再背景預載", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake);
+
+    await h.chat("s1", "qwen3.6-35b-a3b");
+    const pingBefore = countOps(fake.log, "ping");
+
+    h.cleanup();
+    await sleep(10); // 等 dispose（async）完成
+
+    // (a) hook registrations 應被 dispose 移除
+    assert.ok(!h.hooks.has("model.request"), "cleanup 後 model.request hook 應被移除");
+    assert.ok(!h.hooks.has("retry"), "cleanup 後 retry hook 應被移除");
+
+    // (b) 事件訂閱已中止 → unloaded 事件不應觸發背景預載
+    await h.fire({
+      type: "session.execution.failed",
+      data: { sessionID: "s1", error: { type: "unknown", message: "Model is unloaded." } },
+    });
+    await sleep(500); // 超過 250ms debounce
+    assert.equal(countOps(fake.log, "ping"), pingBefore, "cleanup 後不應觸發背景預載");
+  });
+
+  test("模型不在 catalog → fail fast，不 load / unload", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake);
+
+    await assert.rejects(h.chat("s1", "nonexistent-model-xyz"), /不存在於模型庫/);
+
+    assert.equal(countOps(fake.log, "load"), 0, "模型不存在不應 load");
+    assert.equal(countOps(fake.log, "unload"), 0, "模型不存在不應 unload 現有模型");
+    h.cleanup();
+  });
+
+  test("catalog 全空（伺服器離線）→ network 錯誤重試到上限後載入失敗", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    // 包一層 fetchImpl：catalog 回空清單、load 模擬網路錯誤（伺服器離線）
+    const fetchImpl = async (url, init = {}) => {
+      const u = new URL(url);
+      if (u.pathname === "/api/v1/models") return makeRes(200, { models: [] });
+      if (u.pathname === "/api/v1/models/load") {
+        fake.record("load", { key: MODEL_A.key, headers: init.headers });
+        throw new Error("fetch failed: ECONNREFUSED 127.0.0.1:1234");
+      }
+      return fake.fetch(url, init);
+    };
+    const h = await makeHarness(fake, {
+      fetchImpl,
+      maxLoadRetries: 2,
+      loadRetryBaseDelayMs: 5,
+    });
+
+    await assert.rejects(h.chat("s1", "qwen3.6-35b-a3b"), /載入失敗/);
+    assert.equal(
+      countOps(fake.log, "load"),
+      2,
+      "network 錯誤應重試到 maxLoadRetries（2）次"
+    );
+    h.cleanup();
+  });
+
+  test("apiKey → 所有請求帶 Authorization: Bearer header", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake, { apiKey: "secret-token" });
+
+    await h.chat("s1", "qwen3.6-35b-a3b");
+
+    assert.ok(ops(fake.log, "catalog").length >= 1, "應有 catalog 請求");
+    assert.equal(countOps(fake.log, "load"), 1, "應有 load 請求");
+    assert.equal(countOps(fake.log, "ping"), 1, "應有 ping 請求");
+    for (const op of ["catalog", "load", "ping"]) {
+      for (const e of ops(fake.log, op)) {
+        assert.equal(
+          e.headers?.Authorization,
+          "Bearer secret-token",
+          `${op} 請求應帶 Authorization: Bearer token`
+        );
+      }
+    }
+    h.cleanup();
+  });
+
+  test("baseURL 正規化：含 /v1 尾綴仍命中 /api/v1/models", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const urls = [];
+    const fetchImpl = async (url, init = {}) => {
+      urls.push(url);
+      return fake.fetch(url, init);
+    };
+    const h = await makeHarness(fake, {
+      baseURL: "http://lmstudio.test/v1/",
+      fetchImpl,
+    });
+
+    await h.chat("s1", "qwen3.6-35b-a3b");
+
+    assert.ok(urls.length > 0, "應有 API 請求");
+    assert.equal(
+      urls[0],
+      "http://lmstudio.test/api/v1/models",
+      "第一個 catalog 請求應為正規化後的 root URL"
+    );
+    assert.ok(
+      !urls.some((u) => u.includes("/v1/api/v1/")),
+      "不應出現 /v1/api/v1/ 錯誤 URL"
+    );
+    h.cleanup();
+  });
+
+  test("maxSessionModels 淘汰最舊 session → 不再為它背景預載", async () => {
+    const fake = new FakeLMStudio({ models: [MODEL_A] });
+    const h = await makeHarness(fake, { maxSessionModels: 1 });
+
+    await h.chat("s1", "qwen3.6-35b-a3b"); // 建立 s1 記錄
+    await h.chat("s2", "qwen3.6-35b-a3b"); // 容量 1 → s1 被淘汰、由 s2 取代
+    const pingBefore = countOps(fake.log, "ping");
+
+    // 已被淘汰的 s1 → 不觸發背景預載
+    await h.fire({
+      type: "session.execution.failed",
+      data: { sessionID: "s1", error: { type: "unknown", message: "Model is unloaded." } },
+    });
+    await sleep(500);
+    assert.equal(countOps(fake.log, "ping"), pingBefore, "s1 已被淘汰，不應觸發背景預載");
+
+    // 對照組：仍受追蹤的 s2 → 應觸發背景預載（證明差異來自淘汰）
+    await h.fire({
+      type: "session.execution.failed",
+      data: { sessionID: "s2", error: { type: "unknown", message: "Model is unloaded." } },
+    });
+    await sleep(500);
+    assert.ok(
+      countOps(fake.log, "ping") > pingBefore,
+      "對照組：s2 仍在 sessionModels，應觸發背景預載"
+    );
     h.cleanup();
   });
 });

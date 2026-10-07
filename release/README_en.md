@@ -8,7 +8,7 @@ Automatically **unloads the old model and loads the target model** for opencode 
 > This plugin is built for the **opencode V2 plugin API** and verified end-to-end on this machine (2026-10-08):
 > - **opencode 2.0.20 + real LM Studio**: cold-start ensure (catalog → load → poll → ping) → real inference succeeded
 > - **opencode 2.0.20 + mock server**: `model.request` hook (primary/title), `retry` hook (decision override delay 1605→0), event subscription, failure recovery → `session.execution.succeeded`
-> - Unit tests 16/16 pass (`node --test`)
+> - Unit tests 27/27 pass (the live system test auto-SKIPs when LM Studio is not running; `node --test`)
 
 ---
 
@@ -22,7 +22,7 @@ Automatically **unloads the old model and loads the target model** for opencode 
 | **Concurrency serialization** | Concurrent loads of different models run through a **serialized queue** so A is never unloaded right after being loaded by B (fixes the `Model is unloaded` root cause) |
 | **Fast path + cache** | Verified & sole-loaded → zero-latency pass-through (verified cache with instanceId + TTL) |
 | **Reactive preload** | Subscribes to `session.execution.failed`; on `Model is unloaded` → invalidate cache and preload in background, so retries succeed |
-| **Failure auto-recovery** | `retry` hook: on provider request failure, re-ensure synchronously; on success override `decision = {retry:true, delay:0}` for an immediate retry |
+| **Failure auto-recovery** | `retry` hook: **only model-not-ready/unloaded-class errors** are re-ensured synchronously; on success override `decision = {retry:true, delay:0}` for an immediate retry. Other errors keep opencode's default backoff |
 | **Unload completion wait** | unload is async; poll until the instance truly disappears before loading the new model |
 | **Load retries** | Transient errors (503/429/network/busy…) back off and retry; hard failures (404 not found) do not retry |
 | Provider filter | Non-`lmstudio` providers are completely untouched (hooks registered scoped to `{ providerID }`) |
@@ -95,7 +95,7 @@ cp lmstudio-model-loader.js ~/.config/opencode/plugins/lmstudio-model-loader/ind
 cat > ~/.config/opencode/plugins/lmstudio-model-loader/package.json <<'EOF'
 {
   "name": "lmstudio-model-loader",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "private": true,
   "type": "module",
   "exports": { ".": "./index.js" }
@@ -147,6 +147,7 @@ EOF
 | `loadFetchTimeoutMs` | `30000` | load/unload API request timeout |
 | `maxSessionModels` | `500` | Session→model record cap (LRU eviction) |
 | `maxRecoveryAttempts` | `2` | `retry` hook recovery cap (attempt starts at 2) |
+| `recoveryEnsureTimeoutMs` | `15000` | Recovery ensure timeout (retry hook; on timeout the ensure continues in background and decision is left untouched) |
 | `apiKey` | none | LM Studio API key (usually not needed) |
 
 ---
@@ -227,7 +228,7 @@ request dispatched
        ├─ 1. Query currently loaded models（GET /api/v1/models）
        ├─ 2. Fast path: verified & sole-loaded? → pass through（zero latency）
        ├─ 3. Target sole-loaded but cache expired? → skip load, ping to verify
-       ├─ 4. Otherwise: unload other models（wait for completion）→ load（backoff retries）
+       ├─ 4. Otherwise: unload other models（unload timeout → fail fast immediately）→ load（backoff retries）
        ├─ 5. Poll until the target instance appears
        ├─ 6. Ping readiness（max_tokens=1 chat completion）
        │      └─ on "Model is unloaded" → reload and re-verify
@@ -241,10 +242,14 @@ All ensures for different models run through a **global serialized queue**, so c
 ```
 provider request failed（attempt ≥ 2）
   └─ attempt > maxRecoveryAttempts（default 2）？ → leave decision untouched, hand back to opencode
-  └─ otherwise: invalidate verified cache → re-ensure synchronously（catalog → load → ping）
-       ├─ recovered → override event.decision = { retry: true, delay: 0 }（immediate retry）
-       └─ not recovered → leave decision untouched（opencode default backoff）
+  └─ error is NOT a model-not-ready/unloaded class（e.g. rate limit, invalid request）？ → leave decision untouched, keep opencode's default backoff
+  └─ otherwise（model-not-ready/unloaded errors only）: invalidate verified cache → re-ensure synchronously（catalog → load → ping）
+       ├─ recovered → override event.decision = { ...decision, retry: true, delay: 0 }（immediate retry）
+       ├─ failed → leave decision untouched（opencode default backoff）
+       └─ timed out（recoveryEnsureTimeoutMs, default 15s）→ leave decision untouched, ensure keeps running in background
 ```
+
+Only model-not-ready/unloaded-class errors are worth synchronous recovery; all other errors (rate limits, invalid requests, …) keep opencode's default backoff and are never interrupted.
 
 ### 3. `ctx.event.subscribe`（server-wide event stream, reactive preload）
 
@@ -264,10 +269,11 @@ session.deleted（data.sessionID）
 
 | Problem | Fix |
 |---|---|
-| Log: `Plugin must export a default definition with an id and an effect or setup function` | `default` is not a plain `{ id, setup }` object (V1 function form). Upgrade to this version (v3.0.0) |
+| Log: `Plugin must export a default definition with an id and an effect or setup function` | `default` is not a plain `{ id, setup }` object (V1 function form). Upgrade to this version (v3.1.0) |
 | Log: `configured plugin path must be a directory` | The config `plugins` `package` points at a `.js` file. Use the directory form (see “Method 2”) |
 | Log: `Cannot find package '@opencode/plugin'` | The file uses the unsupported `import { Plugin }`. This plugin does not depend on that package; do not modify its import |
-| Request fails: `{"message":"Model is unloaded."}` | Known issue of the old plugin; **upgrade to v3.0.0**. If it still happens the engine really failed to load (e.g. out of memory); check `[lmstudio]` messages on the server stdout |
+| Request fails: `{"message":"Model is unloaded."}` | Known issue of the old plugin; **upgrade to v3.1.0**. If it still happens the engine really failed to load (e.g. out of memory); check `[lmstudio]` messages on the server stdout |
+| Unload timeout error: `LM Studio 卸載逾時: ... 仍在 catalog` | The old model was not unloaded within the deadline; the plugin fails fast to avoid hitting the memory guardrail. Increase `unloadCompletionTimeoutMs`, or restart LM Studio |
 | `[lmstudio] ... 逾時未就緒` / `not ready after timeout` | The engine loaded but can't infer (possibly out of memory). Use a smaller model or lower LM Studio's model loading guardrails |
 | Load failure: `LM Studio 載入失敗: ...` | The model was rejected by LM Studio (possibly out of memory). Use a smaller model or lower guardrails |
 | Model does not auto-switch | 1) confirm the file is in a `plugins/` directory (plural) or a config `plugins` directory entry 2) restart opencode 3) confirm `providerID` is `lmstudio` 4) grep for `loading plugin` as above |
@@ -288,7 +294,7 @@ rm ~/.config/opencode/plugins/lmstudio-model-loader.js   # or the whole lmstudio
 git clone https://github.com/wclinRD/opencode_lmstudio_loader.git
 cd opencode_lmstudio_loader
 
-# Unit tests (16, injected fake server + fake V2 ctx, no LM Studio needed)
+# Unit tests (27, injected fake server + fake V2 ctx, no LM Studio needed)
 npm test
 
 # Real LM Studio system tests (auto-SKIP when not running)

@@ -1,5 +1,5 @@
-lmstudio-model-loader v3.0.0 (opencode V2 plugin API, requires opencode >= 2.0)
-built: 20261008-002354
+lmstudio-model-loader v3.1.0 (opencode V2 plugin API, requires opencode >= 2.0)
+built: 20261008-010320
 files:
   - lmstudio-model-loader.js  (opencode plugin，export default { id, setup })
   - package.json              (測試用，type: module)
