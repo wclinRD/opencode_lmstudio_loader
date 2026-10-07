@@ -43,6 +43,7 @@ mkdir -p "$RELEASE_DIR"
 cp "$PLUGIN_SRC" "$RELEASE_DIR/lmstudio-model-loader.js"
 cp "$PROJECT_DIR/package.json" "$RELEASE_DIR/package.json"
 cp "$PROJECT_DIR/README.md" "$RELEASE_DIR/README.md"
+cp "$PROJECT_DIR/README_en.md" "$RELEASE_DIR/README_en.md"
 
 cat > "$RELEASE_DIR/VERSION.txt" <<EOF
 lmstudio-model-loader v${VERSION} (opencode V2 plugin API, requires opencode >= 2.0)
@@ -50,7 +51,8 @@ built: ${STAMP}
 files:
   - lmstudio-model-loader.js  (opencode plugin，export default { id, setup })
   - package.json              (測試用，type: module)
-  - README.md                 (使用說明)
+  - README.md                 (使用說明，繁體中文)
+  - README_en.md              (使用說明，English)
 
 deploy (auto-discovery, default options):
   cp lmstudio-model-loader.js ~/.config/opencode/plugins/          # 全域

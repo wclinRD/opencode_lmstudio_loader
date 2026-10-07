@@ -1,6 +1,7 @@
 # LM Studio Model Loader Plugin（lmstudio-model-loader）
 
 > 📦 Repository: <https://github.com/wclinRD/opencode_lmstudio_loader>
+> 🌏 English version: [README_en.md](README_en.md) · 中文版：本文件
 
 讓 opencode 在使用 LM Studio 模型（`lmstudio/*`）時，**自動卸載舊模型、載入目標模型**，保證記憶體只保留單一模型，並確保「請求送出前模型引擎真的可以推論」。
 
@@ -36,7 +37,9 @@ lmstudio_auto_switch/
 ├── tests/
 │   ├── lmstudio-model-loader.test.mjs  # 功能測試（注入式 fake server，不需 LM Studio）
 │   └── live.test.mjs                   # 系統測試（真實 LM Studio，未啟動會 SKIP）
-└── README.md                  # 本文件
+├── README.md                  # 使用說明（繁體中文）
+├── README_en.md               # 使用說明（English）
+└── （無額外檔案）
 ```
 
 > ⚠️ **V2 plugin 格式要求**
