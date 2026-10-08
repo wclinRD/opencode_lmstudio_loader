@@ -726,20 +726,20 @@ export default {
       providerID: "lmstudio",
       alwaysSingleModel: true,
       fetchImpl: globalThis.fetch,
-      loadTimeoutMs: 300000,
-      readyTimeoutMs: 300000,
-      unloadCompletionTimeoutMs: 15000,
-      maxLoadRetries: 3,
-      loadRetryBaseDelayMs: 1500,
-      readyTTLMs: 90000,
-      pingEnabled: true,
-      pingMaxTokens: 1,
-      pollIntervalMs: 1000,
-      pingRetryDelayMs: 1500,
-      nudgePollTimeoutMs: 15000,
-      fetchTimeoutMs: 10000,
-      loadFetchTimeoutMs: 30000,
-      maxSessionModels: 500,
+      loadTimeoutMs: 300000,  // 5 分鐘，避免 load 與 engine teardown 競爭
+      readyTimeoutMs: 300000,  // 5 分鐘，避免 ping 與 engine teardown 競爭
+      unloadCompletionTimeoutMs: 3000000,  // 50 分鐘，避免 unload-all 與 engine teardown 競爭
+      maxLoadRetries: 3,  // 連續載入失敗重試上限（per A1）
+      loadRetryBaseDelayMs: 1500,  // 連續載入失敗重試基礎延遲（per A1，指數退避）
+      readyTTLMs: 90000,  // verified cache 就緒快取 TTL（90 秒，避免短時間內重複 ping）
+      pingEnabled: true,  //  是否啟用 ping 就緒驗證（embedding 模型會自動跳過）
+      pingMaxTokens: 1,  // ping 請求的 max_tokens（避免浪費 token）
+      pollIntervalMs: 1000,  // poll catalog 與 ping 的輪詢間隔（避免過度頻繁）
+      pingRetryDelayMs: 1500,  // ping 失敗後重試延遲（避免過度頻繁）
+      nudgePollTimeoutMs: 15000,  // ping 偵測到 unloaded 後重新載入，poll catalog 等待 instance 出現的超時
+      fetchTimeoutMs: 10000,  // fetch 請求逾時（catalog、unload、ping）
+      loadFetchTimeoutMs: 30000,  // fetch 請求逾時（load）
+      maxSessionModels: 500,  // session→model 記錄上限（超過刪最舊，避免無界成長）
       maxRecoveryAttempts: 2, // retry hook 復原上限（attempt 從 2 開始，per A2）
       recoveryEnsureTimeoutMs: 15000, // retry hook 復原 ensure 逾時上限（避免拖住 opencode retry 排程）
       apiKey: undefined,
